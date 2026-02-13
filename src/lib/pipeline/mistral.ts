@@ -7,7 +7,19 @@ const mistralClient = new Mistral({
 
 const MODEL = 'mistral-large-latest';
 const MAX_RETRIES = 3;
-const MIN_QUALITY_SCORE = 8;
+const MIN_QUALITY_SCORE = 7;
+const RETRY_DELAY_BASE = 1000;
+const COST_PER_1K_TOKENS = 0.002;
+
+let totalCost = 0;
+
+export function getTotalCost(): number {
+  return totalCost;
+}
+
+export function resetCostTracking(): void {
+  totalCost = 0;
+}
 
 interface MistralAngleResponse {
   angles: Array<{
@@ -21,28 +33,31 @@ interface MistralAngleResponse {
 }
 
 function buildPrompt(productData: ProductData, visionAnalysis: VisionAnalysis): string {
+  const dominantColors = visionAnalysis.colorPalette?.dominant?.join(', ') || 'Not specified';
+  const visualHooks = visionAnalysis.visualHooks?.hooks?.join(', ') || 'Not specified';
+  const tiktokAppeal = visionAnalysis.visualHooks?.tiktokAppeal || 50;
+  
   return `You are an expert TikTok marketing strategist. Generate 3 high-quality marketing angles for the following product.
 
 Product Information:
 - Name: ${productData.name}
 - Description: ${productData.description}
 - Price: $${productData.price}
-- Category: ${productData.category || 'Not specified'}
-- Key Features: ${productData.features?.join(', ') || 'Not specified'}
+- Rating: ${productData.rating || 'N/A'}/5 (${productData.reviewCount || 0} reviews)
 
 Visual Analysis:
-- Colors: ${visionAnalysis.dominantColors.join(', ')}
-- Detected Objects: ${visionAnalysis.objects.join(', ')}
-- Text Detected: ${visionAnalysis.text.join(', ')}
-- Visual Style: ${visionAnalysis.style}
-- Labels: ${visionAnalysis.labels.join(', ')}
+- Dominant Colors: ${dominantColors}
+- Visual Hooks: ${visualHooks}
+- TikTok Appeal Score: ${tiktokAppeal}/100
+- Packaging Quality: ${visionAnalysis.packagingQuality?.score || 'N/A'}/100
+- Visual Style: ${visionAnalysis.backgroundRecommendations?.style || 'clean'}
 
 Generate EXACTLY 3 distinct marketing angles. Each angle must include:
 1. hook: A catchy 2-second TikTok hook (8-12 words max, attention-grabbing)
 2. script: Complete TikTok script (30-60 seconds when read aloud, 150-300 words)
 3. targetAudience: Specific demographic (age, interests, pain points)
 4. tone: One of: funny, educational, emotional, inspirational, controversial, trending
-5. qualityScore: Self-assessment score 1-10 (must be >= 8)
+5. qualityScore: Self-assessment score 1-10 (must be >= ${MIN_QUALITY_SCORE})
 6. estimatedEngagement: Predicted engagement rate percentage (1-100)
 
 Requirements:
@@ -50,7 +65,7 @@ Requirements:
 - Scripts must be natural, conversational, and TikTok-native
 - Hooks must create immediate curiosity or emotional response
 - Quality scores must reflect realistic assessment of viral potential
-- All 3 angles must score >= 8/10 in quality
+- All 3 angles must score >= ${MIN_QUALITY_SCORE}/10 in quality
 
 Respond with valid JSON only:
 {
@@ -70,11 +85,11 @@ Respond with valid JSON only:
 function validateAngle(angle: any): boolean {
   if (!angle || typeof angle !== 'object') return false;
   
-  if (typeof angle.hook !== 'string' || angle.hook.length < 10 || angle.hook.length > 100) {
+  if (typeof angle.hook !== 'string' || angle.hook.length < 10 || angle.hook.length > 150) {
     return false;
   }
   
-  if (typeof angle.script !== 'string' || angle.script.length < 100 || angle.script.length > 1000) {
+  if (typeof angle.script !== 'string' || angle.script.length < 100 || angle.script.length > 1500) {
     return false;
   }
   
@@ -111,10 +126,16 @@ function calculateAverageQuality(angles: MistralAngleResponse['angles']): number
   return sum / angles.length;
 }
 
-async function callMistralAPI(
+function estimateCost(promptTokens: number, completionTokens: number): number {
+  const totalTokens = promptTokens + completionTokens;
+  return (totalTokens / 1000) * COST_PER_1K_TOKENS;
+}
+
+async function callMistralAPIWithRetry(
   productData: ProductData,
-  visionAnalysis: VisionAnalysis
-): Promise<MistralAngleResponse> {
+  visionAnalysis: VisionAnalysis,
+  attempt: number = 0
+): Promise<{ response: MistralAngleResponse; cost: number }> {
   const prompt = buildPrompt(productData, visionAnalysis);
   
   try {
@@ -127,7 +148,7 @@ async function callMistralAPI(
         },
       ],
       temperature: 0.7,
-      maxTokens: 2000,
+      maxTokens: 2500,
       responseFormat: {
         type: 'json_object',
       },
@@ -149,8 +170,19 @@ async function callMistralAPI(
       throw new Error('Invalid response structure from Mistral API');
     }
     
-    return parsed;
+    const promptTokens = prompt.length / 4;
+    const completionTokens = content.length / 4;
+    const cost = estimateCost(promptTokens, completionTokens);
+    
+    return { response: parsed, cost };
   } catch (error) {
+    if (attempt < MAX_RETRIES) {
+      const delay = RETRY_DELAY_BASE * Math.pow(2, attempt);
+      console.warn(`Mistral API attempt ${attempt + 1} failed, retrying in ${delay}ms...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+      return callMistralAPIWithRetry(productData, visionAnalysis, attempt + 1);
+    }
+    
     if (error instanceof Error) {
       throw new Error(`Mistral API call failed: ${error.message}`);
     }
@@ -170,15 +202,17 @@ export async function generateMarketingAngles(
     throw new Error('Invalid product data: name and description are required');
   }
   
-  if (!visionAnalysis || !visionAnalysis.dominantColors || !visionAnalysis.objects) {
+  if (!visionAnalysis) {
     throw new Error('Invalid vision analysis data');
   }
   
   let lastError: Error | null = null;
   
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+  for (let qualityAttempt = 1; qualityAttempt <= 2; qualityAttempt++) {
     try {
-      const response = await callMistralAPI(productData, visionAnalysis);
+      const { response, cost } = await callMistralAPIWithRetry(productData, visionAnalysis);
+      totalCost += cost;
+      
       const averageQuality = calculateAverageQuality(response.angles);
       
       if (averageQuality < MIN_QUALITY_SCORE) {
@@ -186,40 +220,50 @@ export async function generateMarketingAngles(
           `Quality score too low: ${averageQuality.toFixed(1)}/10 (minimum: ${MIN_QUALITY_SCORE}/10)`
         );
         
-        if (attempt < MAX_RETRIES) {
+        if (qualityAttempt < 2) {
           console.warn(
-            `Attempt ${attempt}/${MAX_RETRIES}: Quality score ${averageQuality.toFixed(1)}/10 is below threshold. Retrying...`
+            `Quality attempt ${qualityAttempt}/2: Score ${averageQuality.toFixed(1)}/10 is below threshold. Retrying...`
           );
-          await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+          await new Promise((resolve) => setTimeout(resolve, 2000));
           continue;
         }
       }
       
-      const marketingAngles: MarketingAngle[] = response.angles.map((angle, index) => ({
-        id: `angle-${Date.now()}-${index}`,
-        hook: angle.hook.trim(),
-        script: angle.script.trim(),
-        targetAudience: angle.targetAudience.trim(),
-        tone: angle.tone.toLowerCase() as MarketingAngle['tone'],
-        qualityScore: Math.round(angle.qualityScore * 10) / 10,
-        estimatedEngagement: Math.round(angle.estimatedEngagement * 10) / 10,
-        createdAt: new Date(),
-      }));
+      const marketingAngles: MarketingAngle[] = response.angles.map((angle, index) => {
+        const confidence = Math.min(100, Math.round((angle.qualityScore / 10) * 100));
+        
+        return {
+          id: `angle-${Date.now()}-${index}`,
+          hook: angle.hook.trim(),
+          script: angle.script.trim(),
+          targetAudience: angle.targetAudience.trim(),
+          tone: angle.tone.toLowerCase() as MarketingAngle['tone'],
+          qualityScore: Math.round(angle.qualityScore * 10) / 10,
+          confidence,
+          estimatedEngagement: Math.round(angle.estimatedEngagement * 10) / 10,
+          createdAt: new Date(),
+          metadata: {
+            model: MODEL,
+            cost,
+            averageQualityScore: averageQuality,
+          },
+        };
+      });
       
       return marketingAngles;
     } catch (error) {
       lastError = error instanceof Error ? error : new Error('Unknown error occurred');
       
-      if (attempt < MAX_RETRIES) {
+      if (qualityAttempt < 2) {
         console.warn(
-          `Attempt ${attempt}/${MAX_RETRIES} failed: ${lastError.message}. Retrying...`
+          `Quality attempt ${qualityAttempt}/2 failed: ${lastError.message}`
         );
-        await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+        await new Promise((resolve) => setTimeout(resolve, 2000));
       }
     }
   }
   
   throw new Error(
-    `Failed to generate marketing angles after ${MAX_RETRIES} attempts. Last error: ${lastError?.message || 'Unknown error'}`
+    `Failed to generate marketing angles with sufficient quality. Last error: ${lastError?.message || 'Unknown error'}`
   );
 }

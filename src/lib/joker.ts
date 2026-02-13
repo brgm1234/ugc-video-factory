@@ -1,46 +1,63 @@
-import { v4 as uuidv4 } from 'uuid';
-import { PipelineState, PipelineStep, PipelineLog, ProductData, VisionAnalysis, MarketingAngle, VideoGenResult, QualityGate, CostBreakdown } from './types';
 import { scrapeProduct } from './pipeline/apify';
 import { analyzeProductImage } from './pipeline/vision';
 import { generateMarketingAngles } from './pipeline/mistral';
+import { removeBackground } from './pipeline/removebg';
 import { generateVideo } from './pipeline/vidgo';
 import { assembleVideo } from './pipeline/shotstack';
-import { removeBackground } from './pipeline/removebg';
 import { PipelineLogger } from './logger';
+import type {
+  PipelineState,
+  PipelineStepStatus,
+  PipelineSteps,
+  ProductData,
+  VisionAnalysis,
+  MarketingAngle,
+  VideoGenResult,
+  QualityGate,
+  CostBreakdown
+} from './types';
+
+interface JokerOptions {
+  productUrl: string;
+  onStateChange?: (state: PipelineState) => void;
+  maxRetries?: number;
+  qualityThreshold?: number;
+}
 
 export class Joker {
-  private state: PipelineState;
-  private logger: PipelineLogger;
+  private productUrl: string;
   private onStateChange?: (state: PipelineState) => void;
+  private maxRetries: number;
+  private qualityThreshold: number;
+  private logger: PipelineLogger;
+  private state: PipelineState;
   private cancelled: boolean = false;
-  private retryCount: Map<string, number> = new Map();
-  private maxRetries: number = 3;
 
-  constructor(onStateChange?: (state: PipelineState) => void) {
-    this.onStateChange = onStateChange;
+  constructor(options: JokerOptions) {
+    this.productUrl = options.productUrl;
+    this.onStateChange = options.onStateChange;
+    this.maxRetries = options.maxRetries ?? 3;
+    this.qualityThreshold = options.qualityThreshold ?? 0.7;
     this.logger = new PipelineLogger();
-    this.state = this.initializeState();
-  }
 
-  private initializeState(): PipelineState {
-    return {
-      id: uuidv4(),
+    this.state = {
+      id: crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2),
+      productUrl: this.productUrl,
       status: 'idle',
       currentStep: null,
       steps: {
-        scraping: { status: 'pending', progress: 0 },
-        vision: { status: 'pending', progress: 0 },
-        background: { status: 'pending', progress: 0 },
-        content: { status: 'pending', progress: 0 },
-        video: { status: 'pending', progress: 0 },
-        assembly: { status: 'pending', progress: 0 },
+        scraping: { status: 'pending', progress: 0, startedAt: null, completedAt: null, error: null },
+        vision: { status: 'pending', progress: 0, startedAt: null, completedAt: null, error: null },
+        background: { status: 'pending', progress: 0, startedAt: null, completedAt: null, error: null },
+        content: { status: 'pending', progress: 0, startedAt: null, completedAt: null, error: null },
+        video: { status: 'pending', progress: 0, startedAt: null, completedAt: null, error: null },
+        assembly: { status: 'pending', progress: 0, startedAt: null, completedAt: null, error: null },
       },
       productData: null,
       visionAnalysis: null,
-      transparentImageUrl: null,
       marketingAngles: [],
-      videoGenResult: null,
-      finalVideoUrl: null,
+      videoResult: null,
+      finalVideo: null,
       costs: {
         scraping: 0,
         vision: 0,
@@ -50,295 +67,284 @@ export class Joker {
         assembly: 0,
         total: 0,
       },
-      startedAt: null,
-      completedAt: null,
-      error: null,
+      totalCost: 0,
+      startTime: new Date().toISOString(),
+      endTime: null,
+      logs: [],
     };
   }
 
-  private updateState(updates: Partial<PipelineState>): void {
-    this.state = { ...this.state, ...updates };
+  private emitStateChange(): void {
+    this.state.logs = this.logger.getLogs();
     if (this.onStateChange) {
-      this.onStateChange(this.state);
+      this.onStateChange({ ...this.state });
     }
   }
 
-  private updateStep(step: keyof PipelineState['steps'], updates: Partial<PipelineStep>): void {
-    this.state.steps[step] = { ...this.state.steps[step], ...updates };
-    if (this.onStateChange) {
-      this.onStateChange(this.state);
-    }
+  private updateStepStatus(
+    step: keyof PipelineSteps,
+    status: PipelineStepStatus,
+    progress: number,
+    error?: string
+  ): void {
+    this.state.steps[step] = { status, progress, error };
+    this.state.currentStep = step;
+    this.emitStateChange();
   }
 
-  private async executeWithRetry<T>(
-    stepName: string,
+  private addCost(step: keyof CostBreakdown, cost: number): void {
+    this.state.costs[step] += cost;
+    this.state.costs.total += cost;
+    this.emitStateChange();
+  }
+
+  private addQualityGate(gate: QualityGate): void {
+    this.state.qualityGates.push(gate);
+    this.emitStateChange();
+  }
+
+  private async retryWithBackoff<T>(
     fn: () => Promise<T>,
-    validator?: (result: T) => number
+    stepName: string,
+    maxAttempts: number = this.maxRetries
   ): Promise<T> {
-    const retries = this.retryCount.get(stepName) || 0;
+    let lastError: Error | null = null;
 
-    try {
-      const result = await fn();
-      
-      if (validator) {
-        const qualityScore = validator(result);
-        this.logger.info(`Quality score for ${stepName}: ${qualityScore}/10`);
-        
-        if (qualityScore < 8 && retries < this.maxRetries) {
-          this.retryCount.set(stepName, retries + 1);
-          this.logger.warn(`Quality below threshold for ${stepName}, retrying (${retries + 1}/${this.maxRetries})`);
-          await this.exponentialBackoff(retries);
-          return this.executeWithRetry(stepName, fn, validator);
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await fn();
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        this.logger.warn(stepName as keyof PipelineSteps, `Attempt ${attempt}/${maxAttempts} failed: ${lastError.message}`);
+
+        if (attempt < maxAttempts) {
+          const backoffMs = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
+          this.logger.info(stepName as keyof PipelineSteps, `Retrying in ${backoffMs}ms...`);
+          await new Promise(resolve => setTimeout(resolve, backoffMs));
         }
       }
+    }
 
-      this.retryCount.set(stepName, 0);
-      return result;
-    } catch (error) {
-      if (retries < this.maxRetries) {
-        this.retryCount.set(stepName, retries + 1);
-        this.logger.error(`Error in ${stepName}, retrying (${retries + 1}/${this.maxRetries})`, { error });
-        await this.exponentialBackoff(retries);
-        return this.executeWithRetry(stepName, fn, validator);
+    throw lastError || new Error(`${stepName} failed after ${maxAttempts} attempts`);
+  }
+
+  private checkCancelled(): void {
+    if (this.cancelled) {
+      throw new Error('Pipeline cancelled');
+    }
+  }
+
+  async run(): Promise<PipelineState> {
+    try {
+      this.logger.info('scraping', 'Starting pipeline', { productUrl: this.productUrl });
+
+      // Step 1: Scraping
+      this.checkCancelled();
+      this.updateStepStatus('scraping', 'running', 0);
+      this.logger.info('scraping', 'Scraping product data...');
+
+      const scrapingResult = await this.retryWithBackoff(
+        () => scrapeProduct(this.productUrl),
+        'scraping'
+      );
+
+      this.state.productData = scrapingResult.data;
+      this.addCost('scraping', scrapingResult.cost);
+      this.addQualityGate({
+        step: 'scraping',
+        passed: scrapingResult.confidence >= this.qualityThreshold,
+        confidence: scrapingResult.confidence,
+        threshold: this.qualityThreshold
+      });
+
+      this.updateStepStatus('scraping', 'completed', 100);
+      this.logger.success('scraping', 'Product data scraped', {
+        title: scrapingResult.data.title,
+        images: scrapingResult.data.images.length,
+        confidence: scrapingResult.confidence
+      });
+
+      // Step 2: Vision Analysis
+      this.checkCancelled();
+      this.updateStepStatus('vision', 'running', 0);
+      this.logger.info('vision', 'Analyzing product images...');
+
+      const visionResult = await this.retryWithBackoff(
+        () => analyzeProductImage(scrapingResult.data.images, scrapingResult.data),
+        'vision'
+      );
+
+      this.state.visionAnalysis = visionResult.data;
+      this.addCost('vision', visionResult.cost);
+      this.addQualityGate({
+        step: 'vision',
+        passed: visionResult.confidence >= this.qualityThreshold,
+        confidence: visionResult.confidence,
+        threshold: this.qualityThreshold
+      });
+
+      this.updateStepStatus('vision', 'completed', 100);
+      this.logger.success('vision', 'Vision analysis completed', {
+        features: visionResult.data.features.length,
+        confidence: visionResult.confidence
+      });
+
+      // Step 3: Background Removal (with graceful degradation)
+      this.checkCancelled();
+      this.updateStepStatus('background', 'running', 0);
+      this.logger.info('background', 'Removing background from primary image...');
+
+      let transparentUrl: string | undefined;
+      try {
+        const bgResult = await this.retryWithBackoff(
+          () => removeBackground(scrapingResult.data.images[0]),
+          'background',
+          2 // Lower retry count for optional step
+        );
+
+        transparentUrl = bgResult.url;
+        this.state.transparentImageUrl = transparentUrl;
+        this.addCost('background', bgResult.cost);
+        this.updateStepStatus('background', 'completed', 100);
+        this.logger.success('background', 'Background removed successfully');
+      } catch (error) {
+        this.logger.warn('background', 'Background removal failed, continuing with original image', {
+          error: error instanceof Error ? error.message : String(error)
+        });
+        this.updateStepStatus('background', 'completed', 100);
       }
-      throw error;
-    }
-  }
 
-  private async exponentialBackoff(retryCount: number): Promise<void> {
-    const delay = Math.min(1000 * Math.pow(2, retryCount), 10000);
-    await new Promise(resolve => setTimeout(resolve, delay));
-  }
+      // Step 4: Content Generation (Marketing Angles)
+      this.checkCancelled();
 
-  private evaluateQuality(step: string, result: any): number {
-    switch (step) {
-      case 'scraping':
-        const productData = result as ProductData;
-        let score = 5;
-        if (productData.title?.length > 10) score += 1;
-        if (productData.description?.length > 50) score += 1;
-        if (productData.images?.length > 0) score += 1;
-        if (productData.price) score += 1;
-        if (productData.features?.length > 0) score += 1;
-        return score;
-      
-      case 'vision':
-        const vision = result as VisionAnalysis;
-        return vision.confidence >= 0.8 ? 9 : vision.confidence >= 0.6 ? 7 : 5;
-      
-      case 'content':
-        const angles = result as MarketingAngle[];
-        return angles.length >= 3 && angles.every(a => a.hook?.length > 10) ? 9 : 7;
-      
-      case 'video':
-        const videoResult = result as VideoGenResult;
-        return videoResult.url ? 9 : 5;
-      
-      default:
-        return 8;
-    }
-  }
+      // Quality gate check before expensive operations
+      const visionGate = this.state.qualityGates.find(g => g.step === 'vision');
+      if (visionGate && !visionGate.passed) {
+        this.logger.warn('content', 'Vision quality below threshold, but continuing...');
+      }
 
-  public async run(productUrl: string): Promise<PipelineState> {
-    this.cancelled = false;
-    this.updateState({ status: 'running', startedAt: Date.now(), error: null });
-    this.logger.info('Pipeline started', { productUrl, pipelineId: this.state.id });
+      this.updateStepStatus('content', 'running', 0);
+      this.logger.info('content', 'Generating marketing angles...');
 
-    try {
-      if (this.cancelled) throw new Error('Pipeline cancelled');
-      await this.runScrapingStep(productUrl);
+      const contentResult = await this.retryWithBackoff(
+        () => generateMarketingAngles(scrapingResult.data, visionResult.data),
+        'content'
+      );
 
-      if (this.cancelled) throw new Error('Pipeline cancelled');
-      await this.runVisionStep();
+      this.state.marketingAngles = contentResult.data;
+      this.addCost('content', contentResult.cost);
+      this.addQualityGate({
+        step: 'content',
+        passed: contentResult.confidence >= this.qualityThreshold,
+        confidence: contentResult.confidence,
+        threshold: this.qualityThreshold
+      });
 
-      if (this.cancelled) throw new Error('Pipeline cancelled');
-      await this.runBackgroundRemovalStep();
+      this.updateStepStatus('content', 'completed', 100);
+      this.logger.success('content', 'Marketing angles generated', {
+        count: contentResult.data.length,
+        confidence: contentResult.confidence
+      });
 
-      if (this.cancelled) throw new Error('Pipeline cancelled');
-      await this.runContentGenerationStep();
+      // Step 5: Video Generation
+      this.checkCancelled();
 
-      if (this.cancelled) throw new Error('Pipeline cancelled');
-      await this.runVideoGenerationStep();
+      // Quality gate check before video generation
+      const contentGate = this.state.qualityGates.find(g => g.step === 'content');
+      if (contentGate && !contentGate.passed) {
+        throw new Error(`Content quality (${contentGate.confidence.toFixed(2)}) below threshold (${this.qualityThreshold}). Stopping before expensive video generation.`);
+      }
 
-      if (this.cancelled) throw new Error('Pipeline cancelled');
-      await this.runAssemblyStep();
+      this.updateStepStatus('video', 'running', 0);
+      this.logger.info('video', 'Generating video content...');
 
-      this.updateState({ status: 'completed', completedAt: Date.now() });
-      this.logger.info('Pipeline completed successfully', { pipelineId: this.state.id });
+      // Use the best marketing angle (first one, as they're sorted by score)
+      const primaryAngle = contentResult.data[0];
+      if (!primaryAngle) {
+        throw new Error('No marketing angles generated');
+      }
+
+      const videoResult = await this.retryWithBackoff(
+        () => generateVideo(
+          primaryAngle,
+          scrapingResult.data.images,
+          transparentUrl
+        ),
+        'video'
+      );
+
+      this.state.videoResult = videoResult.data;
+      this.addCost('video', videoResult.cost);
+
+      this.updateStepStatus('video', 'completed', 100);
+      this.logger.success('video', 'Video generated', {
+        url: videoResult.data.url,
+        duration: videoResult.data.duration
+      });
+
+      // Step 6: Video Assembly
+      this.checkCancelled();
+      this.updateStepStatus('assembly', 'running', 0);
+      this.logger.info('assembly', 'Assembling final video...');
+
+      const assemblyResult = await this.retryWithBackoff(
+        () => assembleVideo(
+          videoResult.data.url,
+          videoResult.data.overlays,
+          videoResult.data.music
+        ),
+        'assembly'
+      );
+
+      this.state.finalVideoUrl = assemblyResult.url;
+      this.addCost('assembly', assemblyResult.cost);
+
+      this.updateStepStatus('assembly', 'completed', 100);
+      this.logger.success('assembly', 'Video assembly completed', {
+        url: assemblyResult.url
+      });
+
+      // Pipeline completed
+      this.state.endTime = Date.now();
+      const duration = this.state.endTime - this.state.startTime;
+      this.logger.success('assembly', 'Pipeline completed successfully', {
+        duration: `${(duration / 1000).toFixed(2)}s`,
+        totalCost: `$${this.state.costs.total.toFixed(4)}`
+      });
+
+      this.emitStateChange();
       return this.state;
+
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      this.updateState({ status: 'failed', error: errorMessage, completedAt: Date.now() });
-      this.logger.error('Pipeline failed', { error: errorMessage, pipelineId: this.state.id });
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const currentStep = this.state.currentStep;
+
+      this.logger.error(currentStep, 'Pipeline failed', { error: errorMessage });
+      this.updateStepStatus(currentStep, 'failed', this.state.steps[currentStep].progress, errorMessage);
+
+      this.state.endTime = Date.now();
+      this.state.error = errorMessage;
+      this.emitStateChange();
+
       throw error;
     }
   }
 
-  private async runScrapingStep(productUrl: string): Promise<void> {
-    this.updateState({ currentStep: 'scraping' });
-    this.updateStep('scraping', { status: 'running', startedAt: Date.now() });
-    this.logger.info('Starting scraping step', { productUrl });
-
-    try {
-      const productData = await this.executeWithRetry(
-        'scraping',
-        () => scrapeProduct(productUrl),
-        (result) => this.evaluateQuality('scraping', result)
-      );
-
-      this.updateState({ productData });
-      this.state.costs.scraping = 0.05;
-      this.state.costs.total += 0.05;
-      this.updateStep('scraping', { status: 'completed', progress: 100, completedAt: Date.now() });
-      this.logger.info('Scraping step completed', { productData });
-    } catch (error) {
-      this.updateStep('scraping', { status: 'failed', error: error instanceof Error ? error.message : 'Scraping failed' });
-      throw error;
-    }
-  }
-
-  private async runVisionStep(): Promise<void> {
-    if (!this.state.productData?.images?.[0]) throw new Error('No product image available');
-    
-    this.updateState({ currentStep: 'vision' });
-    this.updateStep('vision', { status: 'running', startedAt: Date.now() });
-    this.logger.info('Starting vision analysis step');
-
-    try {
-      const visionAnalysis = await this.executeWithRetry(
-        'vision',
-        () => analyzeProductImage(this.state.productData!.images[0]),
-        (result) => this.evaluateQuality('vision', result)
-      );
-
-      this.updateState({ visionAnalysis });
-      this.state.costs.vision = 0.02;
-      this.state.costs.total += 0.02;
-      this.updateStep('vision', { status: 'completed', progress: 100, completedAt: Date.now() });
-      this.logger.info('Vision analysis completed', { visionAnalysis });
-    } catch (error) {
-      this.updateStep('vision', { status: 'failed', error: error instanceof Error ? error.message : 'Vision analysis failed' });
-      throw error;
-    }
-  }
-
-  private async runBackgroundRemovalStep(): Promise<void> {
-    if (!this.state.productData?.images?.[0]) throw new Error('No product image available');
-    
-    this.updateState({ currentStep: 'background' });
-    this.updateStep('background', { status: 'running', startedAt: Date.now() });
-    this.logger.info('Starting background removal step');
-
-    try {
-      const transparentImageUrl = await this.executeWithRetry(
-        'background',
-        () => removeBackground(this.state.productData!.images[0])
-      );
-
-      this.updateState({ transparentImageUrl });
-      this.state.costs.background = 0.10;
-      this.state.costs.total += 0.10;
-      this.updateStep('background', { status: 'completed', progress: 100, completedAt: Date.now() });
-      this.logger.info('Background removal completed');
-    } catch (error) {
-      this.updateStep('background', { status: 'failed', error: error instanceof Error ? error.message : 'Background removal failed' });
-      throw error;
-    }
-  }
-
-  private async runContentGenerationStep(): Promise<void> {
-    if (!this.state.productData || !this.state.visionAnalysis) throw new Error('Missing required data for content generation');
-    
-    this.updateState({ currentStep: 'content' });
-    this.updateStep('content', { status: 'running', startedAt: Date.now() });
-    this.logger.info('Starting content generation step');
-
-    try {
-      const marketingAngles = await this.executeWithRetry(
-        'content',
-        () => generateMarketingAngles(this.state.productData!, this.state.visionAnalysis!),
-        (result) => this.evaluateQuality('content', result)
-      );
-
-      this.updateState({ marketingAngles });
-      this.state.costs.content = 0.03;
-      this.state.costs.total += 0.03;
-      this.updateStep('content', { status: 'completed', progress: 100, completedAt: Date.now() });
-      this.logger.info('Content generation completed', { anglesCount: marketingAngles.length });
-    } catch (error) {
-      this.updateStep('content', { status: 'failed', error: error instanceof Error ? error.message : 'Content generation failed' });
-      throw error;
-    }
-  }
-
-  private async runVideoGenerationStep(): Promise<void> {
-    if (!this.state.marketingAngles?.[0]) throw new Error('No marketing angles available');
-    
-    this.updateState({ currentStep: 'video' });
-    this.updateStep('video', { status: 'running', startedAt: Date.now() });
-    this.logger.info('Starting video generation step');
-
-    try {
-      const videoGenResult = await this.executeWithRetry(
-        'video',
-        () => generateVideo(this.state.marketingAngles![0]),
-        (result) => this.evaluateQuality('video', result)
-      );
-
-      this.updateState({ videoGenResult });
-      this.state.costs.video = 0.50;
-      this.state.costs.total += 0.50;
-      this.updateStep('video', { status: 'completed', progress: 100, completedAt: Date.now() });
-      this.logger.info('Video generation completed');
-    } catch (error) {
-      this.updateStep('video', { status: 'failed', error: error instanceof Error ? error.message : 'Video generation failed' });
-      throw error;
-    }
-  }
-
-  private async runAssemblyStep(): Promise<void> {
-    if (!this.state.videoGenResult || !this.state.transparentImageUrl) throw new Error('Missing required assets for assembly');
-    
-    this.updateState({ currentStep: 'assembly' });
-    this.updateStep('assembly', { status: 'running', startedAt: Date.now() });
-    this.logger.info('Starting video assembly step');
-
-    try {
-      const finalVideoUrl = await this.executeWithRetry(
-        'assembly',
-        () => assembleVideo({
-          backgroundVideoUrl: this.state.videoGenResult!.url,
-          productImageUrl: this.state.transparentImageUrl!,
-          script: this.state.marketingAngles![0],
-        })
-      );
-
-      this.updateState({ finalVideoUrl });
-      this.state.costs.assembly = 0.30;
-      this.state.costs.total += 0.30;
-      this.updateStep('assembly', { status: 'completed', progress: 100, completedAt: Date.now() });
-      this.logger.info('Video assembly completed', { finalVideoUrl });
-    } catch (error) {
-      this.updateStep('assembly', { status: 'failed', error: error instanceof Error ? error.message : 'Video assembly failed' });
-      throw error;
-    }
-  }
-
-  public getState(): PipelineState {
-    return this.state;
-  }
-
-  public getLogs(): PipelineLog[] {
-    return this.logger.getLogs();
-  }
-
-  public getCostBreakdown(): CostBreakdown {
-    return this.state.costs;
-  }
-
-  public cancel(): void {
+  cancel(): void {
     this.cancelled = true;
-    this.updateState({ status: 'cancelled', completedAt: Date.now() });
-    this.logger.warn('Pipeline cancelled by user', { pipelineId: this.state.id });
+    this.logger.warn(this.state.currentStep, 'Pipeline cancellation requested');
+    this.emitStateChange();
+  }
+
+  getState(): PipelineState {
+    return { ...this.state };
+  }
+
+  getCosts(): CostBreakdown {
+    return { ...this.state.costs };
+  }
+
+  getQualityGates(): QualityGate[] {
+    return [...this.state.qualityGates];
   }
 }

@@ -11,6 +11,13 @@ interface AssembleVideoParams {
 interface AssembleVideoResult {
   url: string;
   layers: string[];
+  metadata: {
+    renderId: string;
+    duration: number;
+    resolution: string;
+    cost: number;
+    confidence: number;
+  };
 }
 
 interface ShotstackClip {
@@ -19,6 +26,7 @@ interface ShotstackClip {
     src: string;
     volume?: number;
     trim?: number;
+    html?: string;
   };
   start: number;
   length: number;
@@ -68,6 +76,7 @@ interface ShotstackStatusResponse {
     status: 'queued' | 'fetching' | 'rendering' | 'saving' | 'done' | 'failed';
     url?: string;
     error?: string;
+    duration?: number;
   };
 }
 
@@ -75,6 +84,18 @@ const SHOTSTACK_API_URL = 'https://api.shotstack.io/edit/v1';
 const MAX_RETRIES = 3;
 const POLL_INTERVAL = 3000;
 const MAX_POLL_TIME = 300000;
+const RETRY_DELAY_BASE = 2000;
+const COST_PER_RENDER = 0.05;
+
+let totalCost = 0;
+
+export function getTotalCost(): number {
+  return totalCost;
+}
+
+export function resetCostTracking(): void {
+  totalCost = 0;
+}
 
 class ShotstackClient {
   private client: AxiosInstance;
@@ -106,12 +127,33 @@ class ShotstackClient {
           throw new Error(`Shotstack render failed: ${response.data.message}`);
         }
 
+        if (!response.data.response?.id) {
+          throw new Error('Shotstack render response missing ID');
+        }
+
         return response.data.response.id;
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
         
+        if (axios.isAxiosError(error)) {
+          const status = error.response?.status;
+          
+          if (status === 400 || status === 401 || status === 403) {
+            throw lastError;
+          }
+          
+          if (status === 429 || (status && status >= 500)) {
+            if (attempt < MAX_RETRIES - 1) {
+              const delay = RETRY_DELAY_BASE * Math.pow(2, attempt);
+              console.warn(`Shotstack render attempt ${attempt + 1} failed, retrying in ${delay}ms...`);
+              await this.delay(delay);
+              continue;
+            }
+          }
+        }
+        
         if (attempt < MAX_RETRIES - 1) {
-          await this.delay(Math.pow(2, attempt) * 1000);
+          await this.delay(RETRY_DELAY_BASE * Math.pow(2, attempt));
         }
       }
     }
@@ -119,8 +161,10 @@ class ShotstackClient {
     throw new Error(`Failed to submit render after ${MAX_RETRIES} attempts: ${lastError?.message}`);
   }
 
-  async pollRenderStatus(renderId: string): Promise<string> {
+  async pollRenderStatus(renderId: string): Promise<ShotstackStatusResponse['response']> {
     const startTime = Date.now();
+    let consecutiveErrors = 0;
+    const maxConsecutiveErrors = 5;
 
     while (Date.now() - startTime < MAX_POLL_TIME) {
       try {
@@ -132,13 +176,15 @@ class ShotstackClient {
           throw new Error(`Status check failed: ${response.data.message}`);
         }
 
-        const { status, url, error } = response.data.response;
+        const { status, url, error, duration } = response.data.response;
+
+        consecutiveErrors = 0;
 
         if (status === 'done') {
           if (!url) {
             throw new Error('Render completed but no URL returned');
           }
-          return url;
+          return response.data.response;
         }
 
         if (status === 'failed') {
@@ -147,11 +193,18 @@ class ShotstackClient {
 
         await this.delay(POLL_INTERVAL);
       } catch (error) {
+        consecutiveErrors++;
+        
+        if (consecutiveErrors >= maxConsecutiveErrors) {
+          throw new Error(`Too many consecutive errors while polling: ${error instanceof Error ? error.message : 'Unknown'}`);
+        }
+        
         if (axios.isAxiosError(error) && error.response?.status === 404) {
           await this.delay(POLL_INTERVAL);
           continue;
         }
-        throw error;
+        
+        await this.delay(POLL_INTERVAL);
       }
     }
 
@@ -216,10 +269,11 @@ export function createTimeline(params: {
         {
           asset: {
             type: 'html',
-            src: `<div style="font-family: Arial, sans-serif; font-size: 48px; font-weight: bold; color: white; text-shadow: 2px 2px 4px rgba(0,0,0,0.8); padding: 20px; text-align: center;">${escapeHtml(hook)}</div>`,
+            html: `<div style="font-family: Arial, sans-serif; font-size: 48px; font-weight: bold; color: white; text-shadow: 2px 2px 4px rgba(0,0,0,0.8); padding: 20px; text-align: center;">${escapeHtml(hook)}</div>`,
+            src: '',
           },
           start: 0,
-          length: 2,
+          length: Math.min(3, videoDuration),
           position: 'top',
           offset: {
             y: 0.1,
@@ -236,7 +290,8 @@ export function createTimeline(params: {
     const captionClips: ShotstackClip[] = sentences.map((sentence, index) => ({
       asset: {
         type: 'html',
-        src: `<div style="font-family: Arial, sans-serif; font-size: 36px; color: white; background: rgba(0,0,0,0.7); padding: 15px 30px; border-radius: 8px; text-align: center;">${escapeHtml(sentence.trim())}</div>`,
+        html: `<div style="font-family: Arial, sans-serif; font-size: 36px; color: white; background: rgba(0,0,0,0.7); padding: 15px 30px; border-radius: 8px; text-align: center;">${escapeHtml(sentence.trim())}</div>`,
+        src: '',
       },
       start: index * sentenceDuration,
       length: Math.min(sentenceDuration, videoDuration - index * sentenceDuration),
@@ -265,6 +320,45 @@ function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, m => map[m]);
 }
 
+async function estimateVideoDuration(videoUrl: string): Promise<number> {
+  try {
+    const headResponse = await axios.head(videoUrl, { 
+      timeout: 5000,
+      maxRedirects: 5,
+    });
+    
+    const contentLength = headResponse.headers['content-length'];
+    if (contentLength) {
+      const sizeInMB = parseInt(contentLength) / (1024 * 1024);
+      return Math.min(30, Math.max(10, sizeInMB * 2));
+    }
+  } catch (error) {
+    console.warn('Could not determine video duration, using default:', error);
+  }
+  
+  return 15;
+}
+
+function calculateConfidence(params: {
+  hasVideo: boolean;
+  hasProduct: boolean;
+  hasHook: boolean;
+  hasScript: boolean;
+  duration: number;
+}): number {
+  let confidence = 100;
+  
+  if (!params.hasVideo) confidence -= 40;
+  if (!params.hasProduct) confidence -= 20;
+  if (!params.hasHook) confidence -= 10;
+  if (!params.hasScript) confidence -= 10;
+  
+  if (params.duration < 10) confidence -= 10;
+  if (params.duration > 60) confidence -= 5;
+  
+  return Math.max(0, Math.min(100, confidence));
+}
+
 export async function assembleVideo(params: AssembleVideoParams): Promise<AssembleVideoResult> {
   const apiKey = process.env.SHOTSTACK_API_KEY;
 
@@ -272,18 +366,17 @@ export async function assembleVideo(params: AssembleVideoParams): Promise<Assemb
     throw new Error('SHOTSTACK_API_KEY environment variable is required');
   }
 
+  if (!params.videoUrl) {
+    throw new Error('Video URL is required');
+  }
+
+  if (!params.transparentProductUrl) {
+    throw new Error('Transparent product URL is required');
+  }
+
   const client = new ShotstackClient(apiKey);
 
-  let videoDuration = 15;
-  try {
-    const headResponse = await axios.head(params.videoUrl, { timeout: 5000 });
-    const contentLength = headResponse.headers['content-length'];
-    if (contentLength) {
-      videoDuration = Math.min(30, Math.max(10, parseInt(contentLength) / 500000));
-    }
-  } catch (error) {
-    console.warn('Could not determine video duration, using default:', error);
-  }
+  const videoDuration = await estimateVideoDuration(params.videoUrl);
 
   const timeline = createTimeline({
     videoUrl: params.videoUrl,
@@ -305,17 +398,34 @@ export async function assembleVideo(params: AssembleVideoParams): Promise<Assemb
   };
 
   const renderId = await client.render(renderRequest);
-  const url = await client.pollRenderStatus(renderId);
+  const result = await client.pollRenderStatus(renderId);
+
+  totalCost += COST_PER_RENDER;
 
   const layers = [
     'base_video',
     'product_overlay',
-    hook ? 'hook_text' : '',
+    params.hook ? 'hook_text' : '',
     params.script ? 'captions' : '',
   ].filter(Boolean);
 
+  const confidence = calculateConfidence({
+    hasVideo: Boolean(params.videoUrl),
+    hasProduct: Boolean(params.transparentProductUrl),
+    hasHook: Boolean(params.hook),
+    hasScript: Boolean(params.script),
+    duration: videoDuration,
+  });
+
   return {
-    url,
+    url: result.url!,
     layers,
+    metadata: {
+      renderId,
+      duration: result.duration || videoDuration,
+      resolution: '1080x1920',
+      cost: COST_PER_RENDER,
+      confidence,
+    },
   };
 }
