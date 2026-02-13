@@ -171,6 +171,11 @@ class PipelineLogger {
     return this.logs.some((log) => log.level === 'error');
   }
 
+  public getLastError(): LogEntry | null {
+    const errors = this.logs.filter((log) => log.level === 'error');
+    return errors.length > 0 ? errors[errors.length - 1] : null;
+  }
+
   public getStats(): {
     total: number;
     byLevel: Record<LogLevel, number>;
@@ -201,6 +206,72 @@ class PipelineLogger {
       totalCost: this.getTotalCost(),
       averageQualityScore:
         qualityCount > 0 ? totalQuality / qualityCount : undefined,
+    };
+  }
+
+  public getRecentLogs(count: number = 10): LogEntry[] {
+    return this.logs.slice(-count);
+  }
+
+  public clearOldLogs(maxAge: number = 3600000): void {
+    const cutoff = Date.now() - maxAge;
+    this.logs = this.logs.filter((log) => {
+      const logTime = new Date(log.timestamp).getTime();
+      return logTime >= cutoff;
+    });
+  }
+
+  public addLog(entry: LogEntry): void {
+    this.logs.push(entry);
+  }
+
+  public groupByStep(): Record<string, LogEntry[]> {
+    const grouped: Record<string, LogEntry[]> = {};
+
+    for (const log of this.logs) {
+      if (!grouped[log.step]) {
+        grouped[log.step] = [];
+      }
+      grouped[log.step].push(log);
+    }
+
+    return grouped;
+  }
+
+  public getStepSummary(step: string): {
+    total: number;
+    byLevel: Record<LogLevel, number>;
+    totalCost: number;
+    avgQuality?: number;
+  } {
+    const stepLogs = this.getLogsByStep(step);
+    const byLevel: Record<LogLevel, number> = {
+      info: 0,
+      warn: 0,
+      error: 0,
+      success: 0,
+    };
+
+    let totalCost = 0;
+    let totalQuality = 0;
+    let qualityCount = 0;
+
+    for (const log of stepLogs) {
+      byLevel[log.level]++;
+      if (log.cost !== undefined) {
+        totalCost += log.cost;
+      }
+      if (log.qualityScore !== undefined) {
+        totalQuality += log.qualityScore;
+        qualityCount++;
+      }
+    }
+
+    return {
+      total: stepLogs.length,
+      byLevel,
+      totalCost,
+      avgQuality: qualityCount > 0 ? totalQuality / qualityCount : undefined,
     };
   }
 }

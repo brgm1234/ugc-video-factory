@@ -13,7 +13,7 @@ export interface ProductData {
 }
 
 export interface VisionAnalysis {
-  packagingScore: number; // 1-10
+  packagingScore: number;
   colorPalette: string[];
   visualHooks: string[];
   productPlacement: string;
@@ -24,7 +24,7 @@ export interface VisionAnalysis {
 export interface MarketingAngle {
   id: string;
   title: string;
-  hook: string; // 2-second TikTok hook
+  hook: string;
   script: string;
   targetAudience: string;
   tone: string;
@@ -33,37 +33,52 @@ export interface MarketingAngle {
 }
 
 export interface VideoGenResult {
-  videoUrl: string;
+  url: string;
   thumbnailUrl: string;
   duration: number;
   resolution: string;
   format: string;
 }
 
-export interface PipelineStep {
-  id: string;
-  name: string;
+export interface PipelineStepStatus {
   status: 'pending' | 'running' | 'success' | 'failed' | 'retrying';
-  qualityScore: number | null;
-  cost: number;
-  startTime: string | null;
-  endTime: string | null;
-  retryCount: number;
-  maxRetries: number;
+  progress: number;
+  startedAt: string | null;
+  completedAt: string | null;
   error: string | null;
-  result: any;
+}
+
+export interface PipelineSteps {
+  scraping: PipelineStepStatus;
+  vision: PipelineStepStatus;
+  background: PipelineStepStatus;
+  content: PipelineStepStatus;
+  video: PipelineStepStatus;
+  assembly: PipelineStepStatus;
+}
+
+export interface CostBreakdown {
+  scraping: number;
+  vision: number;
+  background: number;
+  content: number;
+  video: number;
+  assembly: number;
+  total: number;
 }
 
 export interface PipelineState {
   id: string;
   productUrl: string;
   status: 'idle' | 'running' | 'completed' | 'failed';
-  steps: PipelineStep[];
+  currentStep: keyof PipelineSteps | null;
+  steps: PipelineSteps;
   productData: ProductData | null;
   visionAnalysis: VisionAnalysis | null;
   marketingAngles: MarketingAngle[];
   videoResult: VideoGenResult | null;
   finalVideo: { url: string; layers: string[] } | null;
+  costs: CostBreakdown;
   totalCost: number;
   startTime: string | null;
   endTime: string | null;
@@ -84,17 +99,6 @@ export interface QualityGate {
   currentRetry: number;
 }
 
-export interface CostBreakdown {
-  apify: number;
-  openai: number;
-  mistral: number;
-  vidgo: number;
-  shotstack: number;
-  removebg: number;
-  total: number;
-}
-
-// API Response types
 export interface ApiResponse<T = any> {
   success: boolean;
   data?: T;
@@ -110,7 +114,6 @@ export interface StatusResponse extends ApiResponse<PipelineState> {
   pipelineId: string;
 }
 
-// Service-specific types
 export interface ApifyScraperResult {
   name: string;
   price: string;
@@ -231,7 +234,6 @@ export interface RemoveBgResponse {
   };
 }
 
-// Configuration types
 export interface PipelineConfig {
   qualityGates: {
     vision: QualityGate;
@@ -255,7 +257,6 @@ export interface PipelineConfig {
   };
 }
 
-// Error types
 export interface PipelineError extends Error {
   step: string;
   code: string;
@@ -269,15 +270,13 @@ export interface ValidationError extends Error {
   constraints: string[];
 }
 
-// Webhook types
 export interface WebhookPayload {
   event: 'pipeline.started' | 'pipeline.completed' | 'pipeline.failed' | 'step.completed' | 'step.failed';
   pipelineId: string;
   timestamp: string;
-  data: PipelineState | PipelineStep;
+  data: PipelineState | PipelineStepStatus;
 }
 
-// Storage types
 export interface StoredPipeline {
   id: string;
   state: PipelineState;
@@ -286,7 +285,6 @@ export interface StoredPipeline {
   expiresAt: string;
 }
 
-// Queue types
 export interface QueueJob {
   id: string;
   type: 'pipeline' | 'retry' | 'cleanup';
@@ -299,7 +297,6 @@ export interface QueueJob {
   status: 'pending' | 'active' | 'completed' | 'failed' | 'delayed';
 }
 
-// Metrics types
 export interface PipelineMetrics {
   pipelineId: string;
   totalDuration: number;
@@ -310,7 +307,6 @@ export interface PipelineMetrics {
   timestamp: string;
 }
 
-// Video layer types
 export interface VideoLayer {
   id: string;
   type: 'product' | 'background' | 'text' | 'overlay' | 'audio';
@@ -340,12 +336,11 @@ export interface CompositeVideoRequest {
   quality: 'low' | 'medium' | 'high';
 }
 
-// TikTok optimization types
 export interface TikTokOptimization {
   aspectRatio: '9:16' | '1:1' | '16:9';
-  duration: number; // 15-60 seconds
-  hookTiming: number; // 0-3 seconds
-  callToActionTiming: number; // last 5 seconds
+  duration: number;
+  hookTiming: number;
+  callToActionTiming: number;
   textOverlays: Array<{
     text: string;
     start: number;
@@ -361,17 +356,167 @@ export interface TikTokOptimization {
 }
 
 export interface EngagementPrediction {
-  score: number; // 0-100
-  views: string; // e.g., "10k-50k"
+  score: number;
+  views: string;
   likes: string;
   comments: string;
   shares: string;
-  completionRate: number; // 0-1
+  completionRate: number;
   factors: {
     hook: number;
     pacing: number;
     visualAppeal: number;
     audio: number;
     relevance: number;
+  };
+}
+
+export function createInitialPipelineState(productUrl: string): PipelineState {
+  return {
+    id: Math.random().toString(36).substring(2, 11),
+    productUrl,
+    status: 'idle',
+    currentStep: null,
+    steps: {
+      scraping: {
+        status: 'pending',
+        progress: 0,
+        startedAt: null,
+        completedAt: null,
+        error: null,
+      },
+      vision: {
+        status: 'pending',
+        progress: 0,
+        startedAt: null,
+        completedAt: null,
+        error: null,
+      },
+      background: {
+        status: 'pending',
+        progress: 0,
+        startedAt: null,
+        completedAt: null,
+        error: null,
+      },
+      content: {
+        status: 'pending',
+        progress: 0,
+        startedAt: null,
+        completedAt: null,
+        error: null,
+      },
+      video: {
+        status: 'pending',
+        progress: 0,
+        startedAt: null,
+        completedAt: null,
+        error: null,
+      },
+      assembly: {
+        status: 'pending',
+        progress: 0,
+        startedAt: null,
+        completedAt: null,
+        error: null,
+      },
+    },
+    productData: null,
+    visionAnalysis: null,
+    marketingAngles: [],
+    videoResult: null,
+    finalVideo: null,
+    costs: {
+      apify: 0,
+      openai: 0,
+      mistral: 0,
+      vidgo: 0,
+      shotstack: 0,
+      removebg: 0,
+      total: 0,
+    },
+    totalCost: 0,
+    startTime: null,
+    endTime: null,
+    logs: [],
+  };
+}
+
+export function updateStepStatus(
+  state: PipelineState,
+  step: keyof PipelineSteps,
+  status: PipelineStepStatus['status'],
+  progress: number = 0,
+  error: string | null = null
+): PipelineState {
+  const now = new Date().toISOString();
+  const updatedStep: PipelineStepStatus = {
+    ...state.steps[step],
+    status,
+    progress,
+    error,
+  };
+
+  if (status === 'running' && !state.steps[step].startedAt) {
+    updatedStep.startedAt = now;
+  }
+
+  if (status === 'success' || status === 'failed') {
+    updatedStep.completedAt = now;
+    updatedStep.progress = 100;
+  }
+
+  return {
+    ...state,
+    currentStep: status === 'running' ? step : state.currentStep,
+    steps: {
+      ...state.steps,
+      [step]: updatedStep,
+    },
+  };
+}
+
+export function addPipelineLog(
+  state: PipelineState,
+  step: string,
+  level: PipelineLog['level'],
+  message: string,
+  data?: any
+): PipelineState {
+  const log: PipelineLog = {
+    timestamp: new Date().toISOString(),
+    step,
+    level,
+    message,
+    data,
+  };
+
+  return {
+    ...state,
+    logs: [...state.logs, log],
+  };
+}
+
+export function updateCosts(
+  state: PipelineState,
+  costUpdates: Partial<CostBreakdown>
+): PipelineState {
+  const updatedCosts = {
+    ...state.costs,
+    ...costUpdates,
+  };
+
+  updatedCosts.total =
+    updatedCosts.apify +
+    updatedCosts.openai +
+    updatedCosts.mistral +
+    updatedCosts.vidgo +
+    updatedCosts.shotstack +
+    updatedCosts.removebg;
+
+  return {
+    ...state,
+    costs: updatedCosts,
+    totalCost: updatedCosts.total,
   };
 }

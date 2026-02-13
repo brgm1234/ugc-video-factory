@@ -4,12 +4,26 @@ import { VisionAnalysis } from '../types';
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
   timeout: 60000,
-  maxRetries: 2,
+  maxRetries: 0,
 });
 
 const VISION_MODEL = 'gpt-4-vision-preview';
 const MAX_TOKENS = 1500;
 const ANALYSIS_TIMEOUT = 60000;
+const MAX_RETRIES = 3;
+const RETRY_DELAY_BASE = 2000;
+const INPUT_COST_PER_1K = 0.01;
+const OUTPUT_COST_PER_1K = 0.03;
+
+let totalCost = 0;
+
+export function getTotalCost(): number {
+  return totalCost;
+}
+
+export function resetCostTracking(): void {
+  totalCost = 0;
+}
 
 interface VisionPromptResponse {
   packagingQuality: {
@@ -204,6 +218,7 @@ function transformToVisionAnalysis(response: VisionPromptResponse, estimatedCost
     },
     metadata: {
       completenessScore,
+      confidence: completenessScore,
       estimatedCost,
       timestamp: new Date().toISOString(),
       model: VISION_MODEL,
@@ -211,7 +226,7 @@ function transformToVisionAnalysis(response: VisionPromptResponse, estimatedCost
   };
 }
 
-async function callVisionAPI(imageUrl: string): Promise<VisionPromptResponse> {
+async function callVisionAPIWithRetry(imageUrl: string, attempt: number = 0): Promise<VisionPromptResponse> {
   const timeoutPromise = new Promise<never>((_, reject) => {
     setTimeout(() => reject(new Error('Vision API request timed out')), ANALYSIS_TIMEOUT);
   });
@@ -240,37 +255,63 @@ async function callVisionAPI(imageUrl: string): Promise<VisionPromptResponse> {
     temperature: 0.3,
   });
 
-  const completion = await Promise.race([apiPromise, timeoutPromise]);
+  try {
+    const completion = await Promise.race([apiPromise, timeoutPromise]);
 
-  const content = completion.choices[0]?.message?.content;
-  if (!content) {
-    throw new Error('Empty response from Vision API');
+    const content = completion.choices[0]?.message?.content;
+    if (!content) {
+      throw new Error('Empty response from Vision API');
+    }
+
+    return parseVisionResponse(content);
+  } catch (error) {
+    if (error instanceof OpenAI.APIError) {
+      if (error.status === 429 || error.status === 500 || error.status === 503) {
+        if (attempt < MAX_RETRIES) {
+          const delay = RETRY_DELAY_BASE * Math.pow(2, attempt);
+          console.warn(`Vision API error (${error.status}), retrying in ${delay}ms...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          return callVisionAPIWithRetry(imageUrl, attempt + 1);
+        }
+      }
+      
+      if (error.status === 400) {
+        throw new Error(`Invalid image or request: ${error.message}`);
+      } else if (error.status === 401) {
+        throw new Error('OpenAI API authentication failed. Check your API key.');
+      } else if (error.status === 429) {
+        throw new Error('OpenAI API rate limit exceeded. Please try again later.');
+      } else if (error.status === 500 || error.status === 503) {
+        throw new Error('OpenAI API service error. Please try again later.');
+      }
+      throw new Error(`OpenAI API error (${error.status}): ${error.message}`);
+    }
+    throw error;
   }
-
-  return parseVisionResponse(content);
 }
 
-function estimateCost(tokens: number): number {
-  const INPUT_COST_PER_1K = 0.01;
-  const OUTPUT_COST_PER_1K = 0.03;
-  const estimatedInputTokens = 1000;
-  const estimatedOutputTokens = tokens || 800;
-
-  return (
-    (estimatedInputTokens / 1000) * INPUT_COST_PER_1K +
-    (estimatedOutputTokens / 1000) * OUTPUT_COST_PER_1K
-  );
+function estimateCost(inputTokens: number, outputTokens: number): number {
+  const inputCost = (inputTokens / 1000) * INPUT_COST_PER_1K;
+  const outputCost = (outputTokens / 1000) * OUTPUT_COST_PER_1K;
+  return inputCost + outputCost;
 }
 
 export async function analyzeProductImage(imageUrl: string): Promise<VisionAnalysis> {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error('OPENAI_API_KEY environment variable is not set');
+  }
+
   try {
     validateImageUrl(imageUrl);
 
-    const visionResponse = await callVisionAPI(imageUrl);
+    const visionResponse = await callVisionAPIWithRetry(imageUrl);
 
-    const estimatedCost = estimateCost(MAX_TOKENS);
+    const estimatedInputTokens = 1200;
+    const estimatedOutputTokens = 800;
+    const cost = estimateCost(estimatedInputTokens, estimatedOutputTokens);
+    totalCost += cost;
 
-    const analysis = transformToVisionAnalysis(visionResponse, estimatedCost);
+    const analysis = transformToVisionAnalysis(visionResponse, cost);
 
     if (analysis.metadata.completenessScore < 50) {
       console.warn(

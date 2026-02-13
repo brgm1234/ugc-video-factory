@@ -6,7 +6,18 @@ const VIDGO_API_KEY = process.env.VIDGO_API_KEY || '';
 const MAX_POLL_DURATION = 5 * 60 * 1000;
 const POLL_INTERVAL = 5000;
 const MAX_RETRIES = 3;
+const RETRY_DELAY_BASE = 2000;
 const COST_PER_REQUEST = 0.03;
+
+let totalCost = 0;
+
+export function getTotalCost(): number {
+  return totalCost;
+}
+
+export function resetCostTracking(): void {
+  totalCost = 0;
+}
 
 interface VidgoGenerateRequest {
   script: string;
@@ -59,7 +70,19 @@ async function makeVidgoRequest<T>(
         'Content-Type': 'application/json',
       },
       timeout: 30000,
+      validateStatus: (status) => status < 600,
     });
+    
+    if (response.status >= 400) {
+      throw new AxiosError(
+        `HTTP ${response.status}`,
+        String(response.status),
+        response.config,
+        response.request,
+        response
+      );
+    }
+    
     return response.data;
   } catch (error) {
     const axiosError = error as AxiosError;
@@ -67,12 +90,27 @@ async function makeVidgoRequest<T>(
     
     if (statusCode && statusCode >= 500 && statusCode < 600) {
       if (retryCount < MAX_RETRIES) {
-        const delay = Math.pow(2, retryCount) * 1000;
+        const delay = RETRY_DELAY_BASE * Math.pow(2, retryCount);
+        console.warn(`Vidgo API server error (${statusCode}), retrying in ${delay}ms...`);
         await new Promise(resolve => setTimeout(resolve, delay));
         return makeVidgoRequest<T>(url, method, data, retryCount + 1);
       }
       throw new VidgoError(
         `Vidgo API server error: ${axiosError.message}`,
+        statusCode,
+        true
+      );
+    }
+    
+    if (statusCode === 429) {
+      if (retryCount < MAX_RETRIES) {
+        const delay = RETRY_DELAY_BASE * Math.pow(2, retryCount) * 2;
+        console.warn(`Vidgo API rate limit, retrying in ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        return makeVidgoRequest<T>(url, method, data, retryCount + 1);
+      }
+      throw new VidgoError(
+        'Vidgo API rate limit exceeded',
         statusCode,
         true
       );
@@ -107,12 +145,25 @@ async function initiateVideoGeneration(
     throw new VidgoError('At least one product image is required', undefined, false);
   }
 
+  const validImages = productImages.filter(img => {
+    try {
+      new URL(img);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+
+  if (validImages.length === 0) {
+    throw new VidgoError('No valid image URLs provided', undefined, false);
+  }
+
   const requestBody: VidgoGenerateRequest = {
     script: angle.script,
-    images: productImages,
+    images: validImages,
     metadata: {
-      title: angle.headline,
-      tags: angle.hook ? [angle.hook] : [],
+      title: angle.hook,
+      tags: [angle.tone, angle.targetAudience],
     },
   };
 
@@ -132,26 +183,44 @@ async function initiateVideoGeneration(
 async function pollForCompletion(jobId: string): Promise<VidgoStatusResponse> {
   const startTime = Date.now();
   const statusUrl = `${VIDGO_API_URL}/${jobId}`;
+  let consecutiveErrors = 0;
+  const maxConsecutiveErrors = 5;
 
   while (Date.now() - startTime < MAX_POLL_DURATION) {
-    const status = await makeVidgoRequest<VidgoStatusResponse>(
-      statusUrl,
-      'GET'
-    );
-
-    if (status.status === 'completed') {
-      return status;
-    }
-
-    if (status.status === 'failed') {
-      throw new VidgoError(
-        `Video generation failed: ${status.error || 'Unknown error'}`,
-        undefined,
-        false
+    try {
+      const status = await makeVidgoRequest<VidgoStatusResponse>(
+        statusUrl,
+        'GET'
       );
-    }
 
-    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
+      consecutiveErrors = 0;
+
+      if (status.status === 'completed') {
+        return status;
+      }
+
+      if (status.status === 'failed') {
+        throw new VidgoError(
+          `Video generation failed: ${status.error || 'Unknown error'}`,
+          undefined,
+          false
+        );
+      }
+
+      await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
+    } catch (error) {
+      consecutiveErrors++;
+      
+      if (consecutiveErrors >= maxConsecutiveErrors) {
+        throw new VidgoError(
+          `Too many consecutive errors while polling: ${error instanceof Error ? error.message : 'Unknown error'}`,
+          undefined,
+          false
+        );
+      }
+      
+      await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
+    }
   }
 
   throw new VidgoError(
@@ -164,6 +233,12 @@ async function pollForCompletion(jobId: string): Promise<VidgoStatusResponse> {
 function validateVideoMetadata(response: VidgoStatusResponse): void {
   if (!response.video_url) {
     throw new VidgoError('Generated video missing video URL', undefined, false);
+  }
+
+  try {
+    new URL(response.video_url);
+  } catch {
+    throw new VidgoError('Generated video has invalid URL', undefined, false);
   }
 
   if (!response.thumbnail_url) {
@@ -187,6 +262,20 @@ function validateVideoMetadata(response: VidgoStatusResponse): void {
   }
 }
 
+function calculateConfidence(video: VidgoStatusResponse, metadata: { duration: number; resolution: { width: number; height: number } }): number {
+  let confidence = 100;
+  
+  if (metadata.duration < 10) confidence -= 10;
+  if (metadata.duration > 90) confidence -= 5;
+  
+  if (metadata.resolution.width < 1080) confidence -= 10;
+  if (metadata.resolution.height < 1920) confidence -= 10;
+  
+  if (!video.thumbnail_url) confidence -= 5;
+  
+  return Math.max(0, Math.min(100, confidence));
+}
+
 export async function generateVideo(
   angle: MarketingAngle,
   productImages: string[]
@@ -196,18 +285,30 @@ export async function generateVideo(
     const completedVideo = await pollForCompletion(jobId);
     validateVideoMetadata(completedVideo);
 
-    const result: VideoGenResult = {
-      videoUrl: completedVideo.video_url!,
-      thumbnailUrl: completedVideo.thumbnail_url!,
+    totalCost += COST_PER_REQUEST;
+
+    const metadata = {
       duration: completedVideo.duration!,
       resolution: {
         width: completedVideo.resolution!.width,
         height: completedVideo.resolution!.height,
       },
+    };
+
+    const confidence = calculateConfidence(completedVideo, metadata);
+
+    const result: VideoGenResult = {
+      url: completedVideo.video_url!,
+      thumbnailUrl: completedVideo.thumbnail_url!,
+      duration: metadata.duration,
+      resolution: `${metadata.resolution.width}x${metadata.resolution.height}`,
+      format: 'mp4',
       metadata: {
         jobId,
         generatedAt: new Date().toISOString(),
         cost: COST_PER_REQUEST,
+        confidence,
+        quality: confidence >= 80 ? 'high' : confidence >= 60 ? 'medium' : 'low',
       },
     };
 

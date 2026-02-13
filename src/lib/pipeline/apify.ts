@@ -1,4 +1,4 @@
-import axios from 'axios';
+import axios, { AxiosError } from 'axios';
 import * as cheerio from 'cheerio';
 import { ProductData } from '../types';
 
@@ -49,6 +49,8 @@ const APIFY_API_TOKEN = process.env.APIFY_API_TOKEN || '';
 const APIFY_ACTOR_ID = process.env.APIFY_ACTOR_ID || 'apify/web-scraper';
 const APIFY_BASE_URL = 'https://api.apify.com/v2';
 const APIFY_COST_PER_CALL = 0.01;
+const MAX_RETRIES = 3;
+const RETRY_DELAY_BASE = 1000;
 
 let totalCost = 0;
 
@@ -62,6 +64,32 @@ export function resetCostTracking(): void {
 
 function isAmazonUrl(url: string): boolean {
   return /amazon\.(com|co\.uk|de|fr|it|es|ca|com\.mx|com\.br|in|cn|co\.jp|com\.au)/i.test(url);
+}
+
+async function retryWithBackoff<T>(fn: () => Promise<T>, retries: number = MAX_RETRIES): Promise<T> {
+  let lastError: Error | null = null;
+  
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error as Error;
+      
+      if (axios.isAxiosError(error) && error.response) {
+        const status = error.response.status;
+        if (status === 400 || status === 401 || status === 403 || status === 404) {
+          throw error;
+        }
+      }
+      
+      if (attempt < retries - 1) {
+        const delay = RETRY_DELAY_BASE * Math.pow(2, attempt);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+  
+  throw lastError || new Error('Retry failed without error');
 }
 
 async function scrapeWithApify(url: string): Promise<ProductData> {
@@ -97,42 +125,42 @@ async function scrapeWithApify(url: string): Promise<ProductData> {
         }`,
       };
 
-  try {
-    const runResponse = await axios.post<ApifyRunResponse>(
-      runUrl,
+  const runResponse = await retryWithBackoff(async () => {
+    const response = await axios.post<ApifyRunResponse>(
+      runUrl.replace(APIFY_ACTOR_ID, actorId),
       input,
       { headers, timeout: 60000 }
     );
+    
+    if (!response.data || !response.data.data || !response.data.data.id) {
+      throw new ScraperError('Invalid Apify run response', 'INVALID_RESPONSE');
+    }
+    
+    return response;
+  });
 
-    const runId = runResponse.data.data.id;
-    const datasetId = runResponse.data.data.defaultDatasetId;
+  const runId = runResponse.data.data.id;
+  const datasetId = runResponse.data.data.defaultDatasetId;
 
-    await waitForRunCompletion(runId);
+  await waitForRunCompletion(runId);
 
-    const datasetUrl = `${APIFY_BASE_URL}/datasets/${datasetId}/items`;
-    const datasetResponse = await axios.get<ApifyDatasetItem[]>(datasetUrl, {
+  const datasetUrl = `${APIFY_BASE_URL}/datasets/${datasetId}/items`;
+  const datasetResponse = await retryWithBackoff(async () => {
+    return await axios.get<ApifyDatasetItem[]>(datasetUrl, {
       headers,
       params: { format: 'json' },
+      timeout: 30000,
     });
+  });
 
-    if (!datasetResponse.data || datasetResponse.data.length === 0) {
-      throw new ScraperError('No data returned from Apify', 'EMPTY_DATASET');
-    }
-
-    totalCost += APIFY_COST_PER_CALL;
-
-    const item = datasetResponse.data[0];
-    return transformApifyData(item, url);
-  } catch (error: any) {
-    if (axios.isAxiosError(error)) {
-      throw new ScraperError(
-        `Apify API error: ${error.message}`,
-        'APIFY_API_ERROR',
-        { status: error.response?.status, data: error.response?.data }
-      );
-    }
-    throw error;
+  if (!datasetResponse.data || datasetResponse.data.length === 0) {
+    throw new ScraperError('No data returned from Apify', 'EMPTY_DATASET');
   }
+
+  totalCost += APIFY_COST_PER_CALL;
+
+  const item = datasetResponse.data[0];
+  return transformApifyData(item, url);
 }
 
 async function waitForRunCompletion(runId: string, maxWaitTime = 120000): Promise<void> {
@@ -141,9 +169,17 @@ async function waitForRunCompletion(runId: string, maxWaitTime = 120000): Promis
 
   while (Date.now() - startTime < maxWaitTime) {
     const statusUrl = `${APIFY_BASE_URL}/actor-runs/${runId}`;
-    const response = await axios.get(statusUrl, {
-      headers: { 'Authorization': `Bearer ${APIFY_API_TOKEN}` },
+    
+    const response = await retryWithBackoff(async () => {
+      return await axios.get(statusUrl, {
+        headers: { 'Authorization': `Bearer ${APIFY_API_TOKEN}` },
+        timeout: 10000,
+      });
     });
+
+    if (!response.data || !response.data.data || !response.data.data.status) {
+      throw new ScraperError('Invalid status response from Apify', 'INVALID_STATUS_RESPONSE');
+    }
 
     const status = response.data.data.status;
 
@@ -203,8 +239,8 @@ function parsePrice(priceString: string): number {
 }
 
 async function scrapeWithAxios(url: string): Promise<ProductData> {
-  try {
-    const response = await axios.get(url, {
+  const response = await retryWithBackoff(async () => {
+    return await axios.get(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -212,38 +248,36 @@ async function scrapeWithAxios(url: string): Promise<ProductData> {
       },
       timeout: 30000,
     });
+  });
 
-    const $ = cheerio.load(response.data);
-
-    const name = extractName($);
-    const price = extractPrice($);
-    const currency = extractCurrency($);
-    const description = extractDescription($);
-    const ingredients = extractIngredients($);
-    const images = extractImages($, url);
-    const { reviews, rating, reviewCount } = extractReviews($);
-
-    return {
-      url,
-      name,
-      price,
-      currency,
-      description,
-      ingredients,
-      images,
-      reviews,
-      rating,
-      reviewCount,
-      scrapedAt: new Date().toISOString(),
-      source: 'direct',
-    };
-  } catch (error: any) {
-    throw new ScraperError(
-      `Direct scraping failed: ${error.message}`,
-      'DIRECT_SCRAPE_ERROR',
-      { url }
-    );
+  if (!response.data) {
+    throw new ScraperError('Empty response from direct scraping', 'EMPTY_RESPONSE');
   }
+
+  const $ = cheerio.load(response.data);
+
+  const name = extractName($);
+  const price = extractPrice($);
+  const currency = extractCurrency($);
+  const description = extractDescription($);
+  const ingredients = extractIngredients($);
+  const images = extractImages($, url);
+  const { reviews, rating, reviewCount } = extractReviews($);
+
+  return {
+    url,
+    name,
+    price,
+    currency,
+    description,
+    ingredients,
+    images,
+    reviews,
+    rating,
+    reviewCount,
+    scrapedAt: new Date().toISOString(),
+    source: 'direct',
+  };
 }
 
 function extractName($: cheerio.CheerioAPI): string {
@@ -289,10 +323,10 @@ function extractPrice($: cheerio.CheerioAPI): number {
 function extractCurrency($: cheerio.CheerioAPI): string {
   const currencySymbols: Record<string, string> = {
     '$': 'USD',
-    'â¬': 'EUR',
-    'Â£': 'GBP',
-    'Â¥': 'JPY',
-    'â¹': 'INR',
+    '€': 'EUR',
+    '£': 'GBP',
+    '¥': 'JPY',
+    '₹': 'INR',
   };
 
   const priceText = $('.price, [itemprop="price"]').first().text();
@@ -354,9 +388,13 @@ function extractImages($: cheerio.CheerioAPI, baseUrl: string): string[] {
     $(selector).each((_, elem) => {
       const src = $(elem).attr('src') || $(elem).attr('data-src');
       if (src) {
-        const absoluteUrl = src.startsWith('http') ? src : new URL(src, baseUrl).href;
-        if (!absoluteUrl.includes('placeholder') && !absoluteUrl.includes('spacer')) {
-          images.add(absoluteUrl);
+        try {
+          const absoluteUrl = src.startsWith('http') ? src : new URL(src, baseUrl).href;
+          if (!absoluteUrl.includes('placeholder') && !absoluteUrl.includes('spacer')) {
+            images.add(absoluteUrl);
+          }
+        } catch (error) {
+          console.warn(`Failed to parse image URL: ${src}`);
         }
       }
     });
@@ -394,7 +432,7 @@ function extractReviews($: cheerio.CheerioAPI): {
   return { reviews, rating, reviewCount };
 }
 
-export function validateProductData(data: ProductData): { isValid: boolean; score: number; missingFields: string[] } {
+export function validateProductData(data: ProductData): { isValid: boolean; score: number; missingFields: string[]; confidence: number } {
   const requiredFields: Array<{ key: keyof ProductData; weight: number }> = [
     { key: 'name', weight: 2 },
     { key: 'price', weight: 2 },
@@ -428,8 +466,9 @@ export function validateProductData(data: ProductData): { isValid: boolean; scor
 
   const score = Math.round((achievedWeight / totalWeight) * 10);
   const isValid = score >= 6 && data.name !== '' && data.price > 0;
+  const confidence = Math.round((achievedWeight / totalWeight) * 100);
 
-  return { isValid, score, missingFields };
+  return { isValid, score, missingFields, confidence };
 }
 
 export async function scrapeProduct(url: string): Promise<ProductData> {
@@ -444,11 +483,7 @@ export async function scrapeProduct(url: string): Promise<ProductData> {
   }
 
   let productData: ProductData;
-  let useApify = true;
-
-  if (!APIFY_API_TOKEN) {
-    useApify = false;
-  }
+  let useApify = Boolean(APIFY_API_TOKEN);
 
   try {
     if (useApify) {
@@ -477,7 +512,7 @@ export async function scrapeProduct(url: string): Promise<ProductData> {
 
   if (!validation.isValid) {
     throw new ValidationError(
-      `Product data validation failed (score: ${validation.score}/10)`,
+      `Product data validation failed (score: ${validation.score}/10, confidence: ${validation.confidence}%)`,
       validation.missingFields
     );
   }
